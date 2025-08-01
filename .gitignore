@@ -1,0 +1,10 @@
+.idea/
+.vscode/
+summaries/
+bin/
+*.log
+input.json
+output.json
+backups/
+.DS_Store
+analysis/
