@@ -20,15 +20,15 @@ import (
 	"github.com/muesli/reflow/wordwrap"
 )
 
-func initialModel(report *JSONOutput, errors *sync.Map, bsmrVersion string) model {
+func initialModel(report *JSONOutput, errors *sync.Map, tfrrVersion string) model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
 	ti := textinput.New()
 	ti.Focus()
-	ti.CharLimit = 256
-	ti.Width = 50
+	ti.CharLimit = 369
+	ti.Width = 72
 
 	m := model{
 		report:      report,
@@ -40,7 +40,7 @@ func initialModel(report *JSONOutput, errors *sync.Map, bsmrVersion string) mode
 		versions: versions{
 			tf:   report.TFVersion,
 			bfsm: report.Version,
-			bsmr: bsmrVersion,
+			bsmr: tfrrVersion,
 		},
 	}
 	return m
@@ -68,7 +68,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		headerHeight := lipgloss.Height(m.headerView())
 		footerHeight := lipgloss.Height(m.footerView())
 		listHeight := m.termHeight - (headerHeight + footerHeight)
-		viewportHeight := m.termHeight - (headerHeight + footerHeight + 4) // +4 for title/help margins
+		viewportHeight := m.termHeight - (headerHeight + footerHeight + 0)
 
 		if !m.ready {
 			delegate := itemDelegate{}
@@ -92,14 +92,95 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// Global quit
-		if msg.String() == "ctrl+c" {
+		if m.mainList.FilterState() == list.Filtering {
+			break
+		}
+		keyStr := msg.String()
+		switch {
+		case keyStr == "ctrl+c":
+			return m, tea.Quit
+		case keyStr == "q":
+			if m.state == viewExecutionLogDetail {
+				m.state = viewMain
+				m.viewPort.GotoTop()
+				return m, nil
+			}
 			return m, tea.Quit
 		}
-		// Pop view if not in main view
-		if m.state != viewMain && (msg.String() == "q" || msg.String() == "esc") {
-			m.state = m.popView()
-			return m, nil
+
+		switch m.state {
+		case viewMain:
+			// Handle list wrapping before passing the message to the list component
+			if keyStr == "down" || (*figs.Bool(argVimEnabled) && keyStr == "j") {
+				if m.mainList.Index() == len(m.mainList.Items())-1 {
+					m.mainList.Select(0)
+					return m, nil
+				}
+			}
+			if keyStr == "up" || (*figs.Bool(argVimEnabled) && keyStr == "k") {
+				if m.mainList.Index() == 0 {
+					m.mainList.Select(len(m.mainList.Items()) - 1)
+					return m, nil
+				}
+			}
+			if keyStr == "enter" || keyStr == "s" || keyStr == "l" {
+				if i, ok := m.mainList.SelectedItem().(mainItem); ok {
+					m.state = viewExecutionLogDetail
+
+					// --- Corrected Filtering and Wrapping Logic ---
+
+					// 1. Process stdout: filter [command], then truncate at ::debug::
+					stdoutCleaned := filterLinesWithPrefix(i.log.Stdout, "[command]")
+					stdoutFinal := truncateLogAtMarker(stdoutCleaned, "::debug::")
+
+					// 2. Process stderr: filter [command], then truncate at ::debug::
+					stderrCleaned := filterLinesWithPrefix(i.log.Stderr, "[command]")
+					stderrFinal := truncateLogAtMarker(stderrCleaned, "::debug::")
+
+					var content strings.Builder
+					// 3. Wrap the command itself
+					wrappedCommand := wordwrap.String(prettyboy.Command(i.log.Command), m.viewPort.Width)
+
+					content.WriteString(titleStyle.Render("COMMAND:") + "\n")
+					content.WriteString(wrappedCommand + "\n\n")
+					content.WriteString(titleStyle.Render("STDOUT:") + "\n")
+					content.WriteString(wordwrap.String(stdoutFinal, m.viewPort.Width) + "\n\n")
+					content.WriteString(titleStyle.Render("STDERR:") + "\n")
+					content.WriteString(wordwrap.String(stderrFinal, m.viewPort.Width) + "\n\n")
+					content.WriteString(titleStyle.Render("EXIT CODE:") + "\n")
+					content.WriteString(fmt.Sprintf("%d\n", i.log.ExitCode))
+					if i.log.Error != "" {
+						content.WriteString(titleStyle.Render("ERROR:") + "\n")
+						content.WriteString(i.log.Error + "\n")
+					}
+					m.viewPort.SetContent(content.String())
+				}
+				return m, nil
+			}
+		case viewExecutionLogDetail:
+			switch keyStr {
+			case "t", "n":
+				m.viewPort.GotoTop()
+				return m, nil
+			case "b":
+				m.viewPort.GotoBottom()
+				return m, nil
+			case "c":
+				if i, ok := m.mainList.SelectedItem().(mainItem); ok {
+					return m, copyToClipboardCmd(i.log.Command)
+				}
+			case "h":
+				if *figs.Bool(argVimEnabled) {
+					m.state = viewMain
+					m.viewPort.GotoTop()
+					return m, nil
+				}
+				m.setNotification("wtf dude???", false)
+			case "esc":
+				m.state = viewMain
+				m.viewPort.GotoTop()
+				return m, nil
+			}
 		}
 
 	case spinner.TickMsg:
@@ -217,7 +298,7 @@ func (m model) View() string {
 	case viewCommandRunner:
 		mainContent = m.viewCommandRunner()
 	default:
-		mainContent = fmt.Sprintf("Unknown view %d", m.state)
+		mainContent = "Unknown view"
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left,
@@ -227,18 +308,12 @@ func (m model) View() string {
 	)
 }
 
+// --- View-specific Update functions ---
+
 func (m model) updateMainView(msg tea.Msg) (model, tea.Cmd) {
-	if !m.ready {
-		return m, nil
-	}
-	if m.mainList.FilterState() == list.Filtering {
-		var cmd tea.Cmd
-		m.mainList, cmd = m.mainList.Update(msg)
-		return m, cmd
-	}
-	switch asMsg := msg.(type) {
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch asMsg.String() {
+		switch msg.String() {
 		case "q":
 			return m, tea.Quit
 		case "b":
@@ -250,14 +325,13 @@ func (m model) updateMainView(msg tea.Msg) (model, tea.Cmd) {
 		case "c":
 			m.state = m.pushView(viewConfig)
 			return m, m.loadConfigList()
-		case "s", "l", "enter":
+		case "enter":
 			if i, ok := m.mainList.SelectedItem().(mainItem); ok {
 				m.activeExecutionLog = i.log
 				m.state = m.pushView(viewExecutionLogDetail)
 				m.renderExecutionLogDetail()
 			}
 			return m, nil
-		default:
 		}
 	}
 	var cmd tea.Cmd
@@ -266,9 +340,9 @@ func (m model) updateMainView(msg tea.Msg) (model, tea.Cmd) {
 }
 
 func (m model) updateBackupView(msg tea.Msg) (model, tea.Cmd) {
-	switch asMsg := msg.(type) {
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if asMsg.Type == tea.KeyEnter {
+		if msg.Type == tea.KeyEnter {
 			if i, ok := m.backupList.SelectedItem().(backupItem); ok {
 				m.activeBackupItem = i
 				m.state = m.pushView(viewBackupDetail)
@@ -283,9 +357,9 @@ func (m model) updateBackupView(msg tea.Msg) (model, tea.Cmd) {
 }
 
 func (m model) updateBackupDetailView(msg tea.Msg) (model, tea.Cmd) {
-	switch asMsg := msg.(type) {
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch asMsg.String() {
+		switch msg.String() {
 		case "c":
 			return m, copyToClipboardCmd(m.activeBackupItem.val)
 		case "enter":
@@ -311,9 +385,9 @@ func (m model) updateBackupDetailView(msg tea.Msg) (model, tea.Cmd) {
 }
 
 func (m model) updateResultsCategoryView(msg tea.Msg) (model, tea.Cmd) {
-	switch asMsg := msg.(type) {
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if asMsg.Type == tea.KeyEnter {
+		if msg.Type == tea.KeyEnter {
 			if i, ok := m.resultsCategoryList.SelectedItem().(resultCategoryItem); ok {
 				m.activeResultCategory = i.name
 				m.state = m.pushView(viewResultsList)
@@ -327,9 +401,9 @@ func (m model) updateResultsCategoryView(msg tea.Msg) (model, tea.Cmd) {
 }
 
 func (m model) updateResultsListView(msg tea.Msg) (model, tea.Cmd) {
-	switch asMsg := msg.(type) {
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if asMsg.Type == tea.KeyEnter {
+		if msg.Type == tea.KeyEnter {
 			if i, ok := m.resultsResourceList.SelectedItem().(JSONResultItem); ok {
 				m.state = m.pushView(viewResultsDetail)
 				m.renderResourceDetail(i)
@@ -342,9 +416,9 @@ func (m model) updateResultsListView(msg tea.Msg) (model, tea.Cmd) {
 }
 
 func (m model) updateResultsDetailView(msg tea.Msg) (model, tea.Cmd) {
-	switch asMsg := msg.(type) {
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch asMsg.String() {
+		switch msg.String() {
 		case "X":
 			if i, ok := m.resultsResourceList.SelectedItem().(JSONResultItem); ok && i.Command != "" {
 				m.commandRunner.cmd = i.Command
@@ -360,10 +434,26 @@ func (m model) updateResultsDetailView(msg tea.Msg) (model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) updateConfigView(msg tea.Msg) (model, tea.Cmd) {
-	switch asMsg := msg.(type) {
+func (m model) updateExecutionLogDetailView(msg tea.Msg) (model, tea.Cmd) {
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if asMsg.Type == tea.KeyEnter {
+		switch msg.String() {
+		case "c":
+			return m, copyToClipboardCmd(m.activeExecutionLog.Command)
+		case "e":
+			// Suspend bubbletea to allow editor to take over terminal
+			return m, tea.Batch(tea.Suspend, editCommand(m.activeExecutionLog.Command))
+		}
+	}
+	var cmd tea.Cmd
+	m.viewPort, cmd = m.viewPort.Update(msg)
+	return m, cmd
+}
+
+func (m model) updateConfigView(msg tea.Msg) (model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyEnter {
 			if i, ok := m.configList.SelectedItem().(configItem); ok {
 				m.activeConfigItem = i
 				m.textInput.SetValue(i.val)
@@ -378,9 +468,9 @@ func (m model) updateConfigView(msg tea.Msg) (model, tea.Cmd) {
 }
 
 func (m model) updateConfigEditView(msg tea.Msg) (model, tea.Cmd) {
-	switch asMsg := msg.(type) {
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch asMsg.String() {
+		switch msg.String() {
 		case "enter":
 			m.quitMessage = fmt.Sprintf("export %s=\"%s\"", m.activeConfigItem.key, m.textInput.Value())
 			return m, tea.Quit
@@ -392,14 +482,16 @@ func (m model) updateConfigEditView(msg tea.Msg) (model, tea.Cmd) {
 }
 
 func (m model) updateCommandRunnerView(msg tea.Msg) (model, tea.Cmd) {
-	switch asMsg := msg.(type) {
+	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if asMsg.Type == tea.KeyEnter {
+		if msg.Type == tea.KeyEnter {
 			m.state = m.popView() // Return to the results detail view
 		}
 	}
 	return m, nil
 }
+
+// --- TUI Data Loading and Rendering ---
 
 func (m *model) loadMainList() {
 	items := make([]list.Item, len(m.report.ExecutionLogs))
@@ -447,14 +539,14 @@ func (m *model) loadResultsList() tea.Cmd {
 
 func (m *model) loadConfigList() tea.Cmd {
 	var items []list.Item
-	knownKeys := []string{envTfDir, envTfState}
+	knownKeys := []string{envTfDir, envTfState, envExecDir, envConfigFile, envTfS3Bucket, envVimMode}
 	envMap := make(map[string]string)
 
 	for _, key := range knownKeys {
 		envMap[key] = os.Getenv(key)
 	}
 	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "FIGS_") || strings.HasPrefix(e, "OLLAMA_") {
+		if strings.HasPrefix(e, "FIGS_") {
 			parts := strings.SplitN(e, "=", 2)
 			envMap[parts[0]] = parts[1]
 		}
@@ -496,7 +588,7 @@ func (m *model) renderExecutionLogDetail() {
 	var b strings.Builder
 	execLog := m.activeExecutionLog
 	b.WriteString(titleStyle.Render("Command:") + "\n")
-	b.WriteString(wordwrap.String(prettyboy.Command(execLog.Command), m.viewPort.Width-12) + "\n\n")
+	b.WriteString(execLog.Command + "\n\n")
 	b.WriteString(titleStyle.Render(fmt.Sprintf("Exit Code: %d", execLog.ExitCode)) + "\n\n")
 	b.WriteString(titleStyle.Render("STDOUT:") + "\n")
 	b.WriteString(execLog.Stdout + "\n\n")
@@ -515,7 +607,7 @@ func (m *model) renderResourceDetail(item JSONResultItem) {
 	if item.Command != "" {
 		b.WriteString(fmt.Sprintf("\n\n%s\n%s",
 			titleStyle.Render("Suggested Command:"),
-			wordwrap.String(prettyboy.Command(item.Command), m.viewPort.Width-12),
+			wordwrap.String(prettyboy.Command(item.Command), m.viewPort.Width),
 		))
 	}
 	m.viewPort.SetContent(b.String())
@@ -537,7 +629,7 @@ func (m *model) popView() viewState {
 func (m *model) setNotification(msg string, isError bool) {
 	style := notificationStyle
 	if isError {
-		style = notificationStyle.Copy().Background(lipgloss.Color("196"))
+		style = notificationStyle.Background(lipgloss.Color("196"))
 	}
 	m.notification = style.Render(msg)
 }
@@ -551,7 +643,7 @@ func (m model) clearNotificationAfter(d time.Duration) tea.Cmd {
 func (m model) viewCommandRunner() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Executing Command:") + "\n")
-	b.WriteString(wordwrap.String(prettyboy.Command(m.commandRunner.cmd), m.viewPort.Width-12) + "\n\n")
+	b.WriteString(m.commandRunner.cmd + "\n\n")
 	b.WriteString(titleStyle.Render("STDOUT:") + "\n")
 	b.WriteString(m.commandRunner.stdout + "\n")
 	b.WriteString(titleStyle.Render("STDERR:") + "\n")
@@ -560,25 +652,9 @@ func (m model) viewCommandRunner() string {
 	return b.String()
 }
 
-func (m model) updateExecutionLogDetailView(msg tea.Msg) (model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "c":
-			return m, copyToClipboardCmd(m.activeExecutionLog.Command)
-		case "e":
-			// Suspend bubbletea to allow editor to take over terminal
-			return m, tea.Batch(tea.Suspend, editCommand(m.activeExecutionLog.Command))
-		}
-	}
-	var cmd tea.Cmd
-	m.viewPort, cmd = m.viewPort.Update(msg)
-	return m, cmd
-}
-
 func (m model) headerView() string {
 	title := fmt.Sprintf("%s: %s", appName, *figs.String(argInputFile))
-	versions := fmt.Sprintf("tf v%s | btfsm %s | bsmr %s   ", m.versions.tf, m.versions.bfsm, m.versions.bsmr)
+	versions := fmt.Sprintf("tf v%s | rtfs %s | tfrr %s", m.versions.tf, m.versions.bfsm, m.versions.bsmr)
 	spaceWidth := m.termWidth - lipgloss.Width(title) - lipgloss.Width(versions)
 	if spaceWidth < 1 {
 		spaceWidth = 1
@@ -609,15 +685,46 @@ func (m model) helpView() string {
 		return fmt.Sprintf("↑/↓: Navigate | Enter: Details | %s/%s: Back", k("q"), k("esc"))
 	case viewResultsDetail:
 		return fmt.Sprintf("↑/↓: Scroll | %s: Execute Command | %s/%s: Back", k("X"), k("q"), k("esc"))
+	case viewExecutionLogDetail:
+		return fmt.Sprintf("↑/↓: Scroll | %s: Copy Command | %s: Edit & Copy Command | %s/%s: Back", k("c"), k("e"), k("q"), k("esc"))
 	case viewConfig:
 		return fmt.Sprintf("↑/↓: Navigate | Enter: Edit | %s/%s: Back", k("q"), k("esc"))
 	case viewConfigEdit:
 		return fmt.Sprintf("Enter: Save and Quit | %s: Back", k("esc"))
 	case viewCommandRunner:
 		return "Enter: Back"
-	case viewExecutionLogDetail:
-		return fmt.Sprintf("↑/↓: Scroll | %s: Copy | %s: Edit & Copy | %s/%s: Back", k("c"), k("e"), k("q"), k("esc"))
 	default:
 		return fmt.Sprintf("Use %s or %s to go back. %s to quit.", k("q"), k("esc"), k("ctrl+c"))
 	}
+}
+
+// filterLinesWithPrefix removes lines that start with a given prefix.
+func filterLinesWithPrefix(text, prefix string) string {
+	var cleanLines []string
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), prefix) {
+			cleanLines = append(cleanLines, line)
+		}
+	}
+	return strings.Join(cleanLines, "\n")
+}
+
+// truncateLogAtMarker finds the first occurrence of a marker and removes everything from that line onward.
+func truncateLogAtMarker(text, marker string) string {
+	// Find the index of the marker.
+	markerIndex := strings.Index(text, marker)
+	if markerIndex == -1 {
+		// Marker not found, return original text.
+		return text
+	}
+
+	// Find the beginning of the line where the marker was found.
+	lineStartIndex := strings.LastIndex(text[:markerIndex], "\n")
+	if lineStartIndex == -1 {
+		// Marker was on the very first line, so truncate everything.
+		return ""
+	}
+
+	// Return the text up to the start of that line, trimming trailing whitespace.
+	return strings.TrimRight(text[:lineStartIndex], "\n\t ")
 }

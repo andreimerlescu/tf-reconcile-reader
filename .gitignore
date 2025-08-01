@@ -8,3 +8,4 @@ output.json
 backups/
 .DS_Store
 analysis/
+tf-state-man-workspace/
