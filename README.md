@@ -7,14 +7,7 @@ Added additional vim keys including:
 
 ## Installation
 
-Since this is a private repository, you're required to use the `GONOSUMDB`, `GONOPROXY`, and `GOPRIVATE` environment
-variables, set to `github.com/andreimerlescu/*`, but only when installing private resources; thus why you don't want this
-set all the time. Just copy the single line. It's the easiest.
-
 ```bash
-GONOSUMDB="github.com/andreimerlescu/*" \
-GONOPROXY="github.com/andreimerlescu/*" \
-GOPRIVATE="github.com/andreimerlescu/*" \
 go install github.com/andreimerlescu/tf-reconcile-reader@latest
 ```
 
